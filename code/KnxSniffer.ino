@@ -7,12 +7,17 @@
 #include "RingPufferIndex.h"
 #include "KnxHal.h"
 #include <WiFi.h>
+// for disable Brownout
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
 
 WiFiServer server(23);  // TelenetServer
-WiFiClient client ;
+WiFiServer serverK(8023);  // TelenetServer im TRX Format  zum Import in ETS (log mit Putty, dann im ETS Gruppentelegramme einlesen)
+WiFiClient client;
+WiFiClient clientK;
 
-char* ssid = "***";
-char* password = "***";
+const char* ssid = "***";
+const char* password = "***";
 
 bool printed = false;
 int lastTelegramCounter = 0;
@@ -21,6 +26,14 @@ void setup()
 {
 	Serial.begin(115200);
 	Serial.println("KnxSniffer started");
+
+	// Disable Brownout
+	int bor = READ_PERI_REG(RTC_CNTL_BROWN_OUT_REG);
+	Serial.printf("brownoutReg=%X\n", bor);
+	WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0x0); //disable brownout detector
+	bor = READ_PERI_REG(RTC_CNTL_BROWN_OUT_REG);
+	Serial.printf("brownoutReg=%X\n", bor);
+
 	WiFi.begin(ssid, password);
 	Serial.println("Connecting Wifi ");
 	for (int loops = 10; loops > 0; loops--) {
@@ -43,6 +56,7 @@ void setup()
 		ESP.restart();
 	}
 	server.begin();
+	serverK.begin();
 	KnxHalClass::init(34, 0);
 }
 
@@ -53,12 +67,18 @@ void loop()
 	{	// Telegramm vorhanden
 		const int buflen = 200;
 		char out[buflen];
+		char outK[buflen];
 		int len = KnxHalClass::teleLen[idx];
-		int pos = snprintf(out,buflen,"t=%7.3fs  No=%3d len=%2d idx=%1d KnxData=", KnxHalClass::teleTime[idx]/1000.0, KnxHalClass::teleNo[idx], len, idx);
+		int pos = snprintf(out,buflen,"t=%s  No=%3d len=%2d idx=%1d KnxData=", toTime(KnxHalClass::teleTime[idx]).c_str(), KnxHalClass::teleNo[idx], len, idx);
+		int posK = snprintf(outK, buflen, "%s\t29 ", toTime(KnxHalClass::teleTime[idx]).c_str());
 		//Serial.printf("out=%s\n", out);
 		for (size_t i = 0; i < 12 ; i++)
 		{
-			if (i< KnxHalClass::teleLen[idx]) pos += snprintf(out+pos, buflen, "%02X ", KnxHalClass::tele[idx][i]);
+			if (i < KnxHalClass::teleLen[idx])
+			{
+				pos += snprintf(out + pos, buflen-pos, "%02X ", KnxHalClass::tele[idx][i]);
+				posK += snprintf(outK + posK, buflen-posK, "%02X ", KnxHalClass::tele[idx][i]);
+			}
 			else pos += snprintf(out + pos, buflen, "   ");
 		}
 		if (len == 1 && KnxHalClass::tele[idx][0] == 0xCC) pos += snprintf(out + pos, buflen, "ACK\n");
@@ -100,7 +120,11 @@ void loop()
 		{
 			client.printf("%s", out);
 		}
-
+		if (clientK.connected() & ((KnxHalClass::teleLen[idx]!=1 | KnxHalClass::tele[idx][0]!=0xCC)))
+		{	// keine ACK
+			int checkSum = 12;  // todo berechnen
+			clientK.printf("%s %02d\r\n", outK, checkSum);
+		}
 	}
 	// Telnet Connection
 	if (server.hasClient())
@@ -117,6 +141,23 @@ void loop()
 			Serial.println(client.remoteIP() );
 			client.printf("Verbunden mit ");
 			client.println(client.localIP());
+		}
+	}
+	// Server2
+	if (serverK.hasClient())
+	{
+		if (clientK.connected())
+		{
+			Serial.println("Telnet Connection rejected");
+			serverK.available().stop();
+		}
+		else
+		{
+			clientK = serverK.available();
+			Serial.print("Telent Connection accepted from ");
+			Serial.println(clientK.remoteIP());
+			clientK.printf("Verbunden mit ");
+			clientK.println(clientK.localIP());
 		}
 	}
 }
@@ -153,3 +194,16 @@ float toFloat(byte l, byte h)
 	//return float(1.0*a*b);  // todo: nur test
 }
 
+String toTime(long totalMs)
+{
+	unsigned long runMillis = totalMs % 1000;
+	unsigned long allSeconds = totalMs / 1000;
+	int runHours = allSeconds / 3600;
+	int secsRemaining = allSeconds % 3600;
+	int runMinutes = secsRemaining / 60;
+	int runSeconds = secsRemaining % 60;
+
+	char buf[21];
+	sprintf(buf, "%02d:%02d:%02d.%03d", runHours, runMinutes, runSeconds,runMillis);
+	return String(buf);
+}
